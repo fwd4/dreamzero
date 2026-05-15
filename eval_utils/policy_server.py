@@ -8,6 +8,7 @@ Adapted from https://github.com/robo-arena/roboarena/
 import asyncio
 import dataclasses
 import logging
+import time
 import traceback
 
 from openpi_client.base_policy import BasePolicy
@@ -88,19 +89,42 @@ class WebsocketPolicyServer:
         # Send server config to client to configure what gets sent to server.
         await websocket.send(packer.pack(dataclasses.asdict(self._server_config)))
 
+        last_send_time: float | None = None
+
         while True:
             try:
+                recv_start = time.perf_counter()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
-                
+                recv_end = time.perf_counter()
+
+                # Queue time: wall time client spent waiting since our last response
+                queue_ms = (recv_end - last_send_time) * 1000 if last_send_time is not None else 0.0
+
                 endpoint = obs["endpoint"]
                 del obs["endpoint"]
                 if endpoint == "reset":
                     self._policy.reset(obs)
                     to_return = "reset successful"
                 else:
+                    infer_start = time.perf_counter()
                     action = self._policy.infer(obs)
-                    to_return = packer.pack(action)
+                    infer_ms = (time.perf_counter() - infer_start) * 1000
+                    # Top-level ``infer_ms`` mirrors the cosmos3 server's
+                    # response shape so robolab's orchestrated client can
+                    # capture timing without backend-specific parsing. The
+                    # nested ``server_timing`` block carries the same value
+                    # plus client-queue wait for any consumer that wants both.
+                    to_return = packer.pack({
+                        "actions": action,
+                        "infer_ms": round(infer_ms, 2),
+                        "server_timing": {
+                            "queue_ms": round(queue_ms, 2),
+                            "infer_ms": round(infer_ms, 2),
+                        },
+                    })
+
                 await websocket.send(to_return)
+                last_send_time = time.perf_counter()
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
                 break

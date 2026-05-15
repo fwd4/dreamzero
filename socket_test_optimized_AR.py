@@ -1,12 +1,14 @@
 import dataclasses
+import io
 import logging
 import socket
 import asyncio
 import os
 import http
-import logging
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 import tyro
 from einops import rearrange
@@ -17,10 +19,18 @@ from groot.vla.data.schema import EmbodimentTag
 import imageio
 import numpy as np
 
+# Optional S3 upload (only active when AWS_* env vars are set in the
+# container). Used by ARDroidRoboarenaPolicy._save_session_video to ship
+# imagined videos to s3://{STORAGE_BUCKET}/{STORAGE_PREFIX}/{run_id}/...
+# alongside cosmos3's per-task/per-env layout.
+try:
+    import boto3  # noqa: PLC0415
+    _BOTO3_OK = True
+except ImportError:
+    _BOTO3_OK = False
+
 from openpi_client import base_policy as _base_policy
-from openpi_client import msgpack_numpy
-import websockets.asyncio.server as _server
-import websockets.frames
+import websockets.asyncio.server as _server  # noqa: F401 — used by _health_check signature
 from tianshou.data import Batch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -36,57 +46,146 @@ class Args:
     port: int = 8000
     timeout_seconds: int = 50000  # 10 hours default, configurable
     model_path: str = "./checkpoints/dreamzero"
-    enable_dit_cache: bool = False
+    enable_dit_cache: bool = True
+    num_dit_steps: int = 8
+    num_inference_steps: int | None = None
+    profile_inference: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    no_frame_buffer: bool = False  # If True, skip temporal frame accumulation and always infer from the single latest frame.
+
+
+@dataclasses.dataclass
+class _SessionState:
+    """Per-session inference state for ARDroidRoboarenaPolicy.
+
+    Each unique session_id (one per parallel env) gets its own frame buffers
+    and call counter so that interleaved requests from different envs never
+    corrupt each other's temporal context.
+    """
+    frame_buffers: dict = dataclasses.field(default_factory=lambda: {
+        "video.exterior_image_1_left": [],
+        "video.exterior_image_2_left": [],
+        "video.wrist_image_left": [],
+    })
+    call_count: int = 0
+    video_across_time: list = dataclasses.field(default_factory=list)
+    # Captured from the first obs in the session so we can build the
+    # canonical S3 key when saving the imaginary video at evict time.
+    episode_id: str = ""   # e.g. "FoodPacking1CansTask/Run0Env0"
+    run_id: str = ""       # client's run_id uuid
+
+
+# Module-level S3 client + upload pool, created lazily once env vars are seen.
+_S3_CLIENT = None
+_S3_POOL: ThreadPoolExecutor | None = None
+_S3_BUCKET: str | None = None
+_S3_PREFIX: str | None = None
+
+
+def _maybe_init_s3() -> None:
+    """Idempotent S3 client init from AWS_* + STORAGE_{BUCKET,PREFIX} env vars."""
+    global _S3_CLIENT, _S3_POOL, _S3_BUCKET, _S3_PREFIX
+    if _S3_CLIENT is not None:
+        return
+    if not _BOTO3_OK:
+        return
+    bucket = os.environ.get("STORAGE_BUCKET")
+    prefix = os.environ.get("STORAGE_PREFIX")
+    ak = os.environ.get("AWS_ACCESS_KEY_ID")
+    sk = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if not (bucket and prefix and ak and sk):
+        logger.info(
+            "[s3] imaginary-mp4 upload disabled "
+            f"(bucket={bool(bucket)} prefix={bool(prefix)} ak={bool(ak)})"
+        )
+        return
+    try:
+        _S3_CLIENT = boto3.client(
+            "s3",
+            aws_access_key_id=ak,
+            aws_secret_access_key=sk,
+            endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+            region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        )
+        _S3_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="s3-imag")
+        _S3_BUCKET = bucket
+        _S3_PREFIX = prefix
+        logger.info(f"[s3] imaginary-mp4 upload enabled -> s3://{bucket}/{prefix}/")
+    except Exception as e:
+        logger.warning(f"[s3] init failed: {e}")
+
+
+def _upload_imaginary_to_s3(mp4_bytes: bytes, key: str, episode_id: str) -> None:
+    """Worker-thread S3 PUT for one imaginary mp4. Errors are logged, not raised."""
+    try:
+        t0 = time.monotonic()
+        _S3_CLIENT.put_object(
+            Bucket=_S3_BUCKET,
+            Key=key,
+            Body=mp4_bytes,
+            ContentType="video/mp4",
+        )
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        logger.info(
+            f"[s3] uploaded imaginary mp4 -> s3://{_S3_BUCKET}/{key} "
+            f"({len(mp4_bytes)/1024:.1f} KB, {elapsed_ms:.0f} ms, {episode_id})"
+        )
+    except Exception as e:
+        logger.warning(f"[s3] upload failed for {key}: {e}")
 
 
 class ARDroidRoboarenaPolicy:
     """Wrapper policy that implements roboarena.policy.BasePolicy interface for AR_droid.
-    
+
     Handles:
     - Observation format conversion (roboarena -> AR_droid format)
-    - Frame accumulation across calls (roboarena sends single frames, AR_droid expects multi-frame video)
+    - Per-session frame accumulation (each parallel env has isolated buffers)
     - Action format conversion (AR_droid dict -> roboarena array format)
     - Distributed inference coordination
+
+    Frame-buffer design
+    -------------------
+    State is keyed by session_id so that N parallel envs can share one server
+    without their frame histories contaminating each other.
+
+    Padding policy: we enter multi-frame mode only once a session has
+    accumulated FRAMES_PER_CHUNK genuine frames.  Until then we send a single
+    (latest) frame — the model resets its KV cache on 1-frame input, which is
+    the same behaviour as the previous global-state implementation and avoids
+    feeding out-of-distribution repeated-frame padding during episode warmup.
+
+    KV-cache note: the underlying WANPolicyHead stores current_start_frame and
+    KV tensors as single shared attributes.  Interleaved sessions therefore
+    still cross-contaminate the KV cache; full per-session KV isolation would
+    require save/restore of those tensors and is left as future work.
     """
-    
-    # Number of frames to accumulate after the first call
+
+    # Number of genuine frames required before switching to multi-frame mode.
     FRAMES_PER_CHUNK = 4
-    
+
     def __init__(
         self,
         groot_policy: GrootSimPolicy,
         signal_group: dist.ProcessGroup,
         output_dir: str | None = None,
+        no_frame_buffer: bool = False,
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
         self._output_dir = output_dir
-        
-        # Frame buffers for accumulation (per camera view)
-        self._frame_buffers: dict[str, list[np.ndarray]] = {
-            "video.exterior_image_1_left": [],
-            "video.exterior_image_2_left": [],
-            "video.wrist_image_left": [],
-        }
-        self._call_count = 0
-        self._is_first_call = True
-        
-        # Session tracking - reset state when new session starts
-        self._current_session_id: str | None = None
-        
-        # Video across time for saving (similar to original server)
-        self.video_across_time = []
+        self._no_frame_buffer = no_frame_buffer
+
+        # Per-session state: keyed by session_id string.
+        self._sessions: dict[str, _SessionState] = {}
         self._msg_index = 0
-        
-        # Create output directory if specified
+
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
-    
-    def _convert_observation(self, obs: dict) -> dict:
+
+    def _convert_observation(self, obs: dict, session: _SessionState) -> dict:
         """Convert roboarena observation format to AR_droid format.
-        
+
         Roboarena format:
             - observation/exterior_image_0_left: (H, W, 3) single frame
             - observation/exterior_image_1_left: (H, W, 3) single frame
@@ -94,7 +193,7 @@ class ARDroidRoboarenaPolicy:
             - observation/joint_position: (7,)
             - observation/gripper_position: (1,)
             - prompt: str
-        
+
         AR_droid format:
             - video.exterior_image_1_left: (T, H, W, 3) multi-frame
             - video.exterior_image_2_left: (T, H, W, 3) multi-frame
@@ -104,75 +203,70 @@ class ARDroidRoboarenaPolicy:
             - annotation.language.action_text: str
         """
         converted = {}
-        
+
         # Map image keys (roboarena uses 0-indexed, AR_droid uses 1-indexed)
         image_key_mapping = {
             "observation/exterior_image_0_left": "video.exterior_image_1_left",
             "observation/exterior_image_1_left": "video.exterior_image_2_left",
             "observation/wrist_image_left": "video.wrist_image_left",
         }
-        
-        # Accumulate frames for each camera view
-        for roboarena_key, droid_key in image_key_mapping.items():
-            if roboarena_key in obs:
-                data = obs[roboarena_key]
-                if isinstance(data, np.ndarray):
-                    if data.ndim == 4:
-                        # Multiple frames (T, H, W, 3)
-                        self._frame_buffers[droid_key].extend(list(data))
-                    else:
-                        # Single frame (H, W, 3)
-                        self._frame_buffers[droid_key].append(data)
 
-        # Determine how many frames to use
-        if self._is_first_call:
-            # First call: use only 1 frame
-            num_frames = 1
+        if self._no_frame_buffer:
+            # No temporal accumulation: always infer from the single latest frame only.
+            for roboarena_key, droid_key in image_key_mapping.items():
+                if roboarena_key in obs:
+                    data = obs[roboarena_key]
+                    if isinstance(data, np.ndarray):
+                        frame = data[-1] if data.ndim == 4 else data
+                        converted[droid_key] = frame[np.newaxis]  # (1, H, W, 3)
         else:
-            # Subsequent calls: use exactly FRAMES_PER_CHUNK frames
-            num_frames = self.FRAMES_PER_CHUNK
-        
-        # Build video tensors from accumulated frames
-        for droid_key, buffer in self._frame_buffers.items():
-            if len(buffer) > 0:
-                if len(buffer) >= num_frames:
-                    # Take the last num_frames frames
+            # Append incoming frame(s) to per-session buffers
+            for roboarena_key, droid_key in image_key_mapping.items():
+                if roboarena_key in obs:
+                    data = obs[roboarena_key]
+                    if isinstance(data, np.ndarray):
+                        if data.ndim == 4:
+                            session.frame_buffers[droid_key].extend(list(data))
+                        else:
+                            session.frame_buffers[droid_key].append(data)
+
+            # Switch to multi-frame mode only once every camera has FRAMES_PER_CHUNK
+            # genuine frames.  Before that, send the single latest frame so the model
+            # resets cleanly rather than receiving out-of-distribution padding.
+            min_buf = min(len(b) for b in session.frame_buffers.values())
+            num_frames = self.FRAMES_PER_CHUNK if min_buf >= self.FRAMES_PER_CHUNK else 1
+
+            # Build video tensors and keep buffers bounded
+            for droid_key, buffer in session.frame_buffers.items():
+                if buffer:
                     frames_to_use = buffer[-num_frames:]
-                else:
-                    # Pad by repeating the first frame to reach num_frames
-                    frames_to_use = buffer.copy()
-                    while len(frames_to_use) < num_frames:
-                        # Prepend the first frame to pad
-                        frames_to_use.insert(0, buffer[0])
-                # Stack to (T, H, W, C)
-                video = np.stack(frames_to_use, axis=0)
-                converted[droid_key] = video
-        
+                    converted[droid_key] = np.stack(frames_to_use, axis=0)
+                    # Trim to at most FRAMES_PER_CHUNK so memory stays bounded
+                    if len(buffer) > self.FRAMES_PER_CHUNK:
+                        session.frame_buffers[droid_key] = buffer[-self.FRAMES_PER_CHUNK:]
+
         # Convert state observations
         if "observation/joint_position" in obs:
             joint_pos = obs["observation/joint_position"]
-            # Reshape to (1, 7) if needed
             if joint_pos.ndim == 1:
                 joint_pos = joint_pos.reshape(1, -1)
             converted["state.joint_position"] = joint_pos.astype(np.float64)
         else:
             converted["state.joint_position"] = np.zeros((1, 7), dtype=np.float64)
-        
+
         if "observation/gripper_position" in obs:
             gripper_pos = obs["observation/gripper_position"]
-            # Reshape to (1, 1) if needed
             if gripper_pos.ndim == 1:
                 gripper_pos = gripper_pos.reshape(1, -1)
             converted["state.gripper_position"] = gripper_pos.astype(np.float64)
         else:
             converted["state.gripper_position"] = np.zeros((1, 1), dtype=np.float64)
-        
-        # Convert prompt
+
         if "prompt" in obs:
             converted["annotation.language.action_text"] = obs["prompt"]
         else:
             converted["annotation.language.action_text"] = ""
-        
+
         return converted
     
     def _convert_action(self, action_dict: dict) -> np.ndarray:
@@ -244,235 +338,205 @@ class ARDroidRoboarenaPolicy:
     
     def infer(self, obs: dict) -> np.ndarray:
         """Infer actions from observations.
-        
+
         Args:
             obs: Observation dict in roboarena format
-            
+
         Returns:
             action: (N, 8) action array
         """
-        # Check for session change - reset state if new session
-        session_id = obs.get("session_id", None)
-        if session_id is not None and session_id != self._current_session_id:
-            if self._current_session_id is not None:
-                logger.info(f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state")
-                # Reset state for new session
-                self._reset_state()
-            else:
-                logger.info(f"New session started: '{session_id}'")
-            self._current_session_id = session_id
-        
+        session_id = obs.get("session_id") or "__default__"
+
+        # Get or create per-session state — no global reset on session change
+        if session_id not in self._sessions:
+            logger.info(f"New session: '{session_id}'")
+            self._sessions[session_id] = _SessionState()
+        session = self._sessions[session_id]
+        # Capture episode_id / run_id from every request that carries them.
+        # The S3 key built at session-evict needs both. Idempotent overwrite
+        # to the most-recent non-empty value rescues a late-stamped request
+        # if the first one was missing the fields (e.g. older client, patch
+        # run, retry). Skip empty values so a single later malformed request
+        # doesn't clear the captured ids.
+        ep = obs.get("episode_id")
+        if ep:
+            session.episode_id = ep
+        rid = obs.get("run_id")
+        if rid:
+            session.run_id = rid
+
         self._msg_index += 1
-        self._call_count += 1
-        
-        # Convert observation format
-        converted_obs = self._convert_observation(obs)
-        
+        session.call_count += 1
+
+        # Convert observation using per-session buffers
+        converted_obs = self._convert_observation(obs, session)
+
         # Signal workers to continue (0 = continue)
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
         dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-        
+
         # Broadcast obs to workers
         self._broadcast_batch_to_workers(converted_obs)
-        
-        # Create batch for policy
-        batch = Batch(obs=converted_obs)
-        
+
         # Distributed forward pass
+        batch = Batch(obs=converted_obs)
         dist.barrier()
         with torch.no_grad():
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
         dist.barrier()
-        
-        # Store video predictions for potential saving
-        self.video_across_time.append(video_pred)
-        
+
+        session.video_across_time.append(video_pred)
+
         # Extract and convert action
         action_chunk_dict = result_batch.act
-        
-        # Convert Batch to dict
-        action_dict = {}
-        for k in dir(action_chunk_dict):
-            if k.startswith("action."):
-                action_dict[k] = getattr(action_chunk_dict, k)
-        
-        action = self._convert_action(action_dict)
-        
-        # Update first call flag
-        if self._is_first_call:
-            self._is_first_call = False
-        
-        return action
-    
-    def _reset_state(self, save_video: bool = True) -> None:
-        """Internal method to reset policy state.
-        
-        Args:
-            save_video: Whether to save accumulated video before reset.
+        action_dict = {k: getattr(action_chunk_dict, k) for k in dir(action_chunk_dict) if k.startswith("action.")}
+        return self._convert_action(action_dict)
+
+    def _save_session_video(self, session: _SessionState) -> None:
+        """Decode the imaginary video accumulated for one session and ship it.
+
+        Writes locally (legacy) when ``self._output_dir`` is set AND uploads
+        to S3 when ``_S3_CLIENT`` is configured. The S3 path mirrors cosmos3's
+        per-(task, run, env) layout:
+
+            s3://{STORAGE_BUCKET}/{STORAGE_PREFIX}/{run_id}/{episode_id}/
+                imaginary/imaginary_episode.mp4
         """
-        # Optionally save accumulated video before reset
-        if save_video and len(self.video_across_time) > 0 and self._output_dir:
-            try:
-                frame_list = []
-                video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                frames = self._policy.trained_model.action_head.vae.decode(
-                    video_across_time_cat,
-                    tiled=self._policy.trained_model.action_head.tiled,
-                    tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                    tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
+        if not session.video_across_time:
+            return
+        if not self._output_dir and _S3_CLIENT is None:
+            return
+        try:
+            video_across_time_cat = torch.cat(session.video_across_time, dim=2)
+            frames = self._policy.trained_model.action_head.vae.decode(
+                video_across_time_cat,
+                tiled=self._policy.trained_model.action_head.tiled,
+                tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
+                tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
+            )
+            frames = rearrange(frames, "B C T H W -> B T H W C")[0]
+            frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+            frame_list = list(frames)
+            if not (frame_list and len(frame_list[0].shape) == 3 and frame_list[0].shape[2] in [1, 3, 4]):
+                return
+            timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
+            n_blocks = (len(frame_list) - 1) // 8
+
+            # Pick the encode fps so the imaginary mp4's wall-clock duration
+            # equals the simulator's wall-clock duration for the same
+            # episode. The world model emits ~4 imaginary frames per
+            # ``open_loop_horizon``-step sim chunk, so a fixed ``fps=15``
+            # would play ~6× faster than sim — useless for side-by-side
+            # comparison or a LeRobot dataset that wants matching episode
+            # lengths across video columns.
+            #
+            #   fps_imaginary = total_frames / (num_chunks × chunk_duration_s)
+            #
+            # where ``chunk_duration_s = open_loop_horizon / sim_fps`` is a
+            # property of the client-side eval loop, not the model. The
+            # orchestrator (or operator) sets ``SIM_CHUNK_DURATION_S`` to
+            # match the client's config (default 1.6s = 24 sim steps at
+            # 15 Hz). Falls back to a fixed 15 fps when the env var is
+            # absent so legacy local-dev runs still produce something.
+            num_chunks = len(session.video_across_time)
+            chunk_duration_s_env = os.environ.get("SIM_CHUNK_DURATION_S")
+            if chunk_duration_s_env and num_chunks > 0:
+                try:
+                    chunk_duration_s = float(chunk_duration_s_env)
+                    target_fps = max(1.0, len(frame_list) / (num_chunks * chunk_duration_s))
+                except (ValueError, ZeroDivisionError):
+                    target_fps = 15.0
+            else:
+                target_fps = 15.0
+            logger.info(
+                f"[s3] encoding imaginary mp4 at fps={target_fps:.2f} "
+                f"({len(frame_list)} frames / {num_chunks} chunks; "
+                f"SIM_CHUNK_DURATION_S={chunk_duration_s_env or 'unset → fps=15'})"
+            )
+
+            # Encode once into a buffer; reuse for both local + S3 paths.
+            mp4_buf = io.BytesIO()
+            # imageio writes via a file-like with a name to pick the format.
+            mp4_buf.name = "imaginary_episode.mp4"
+            imageio.mimsave(mp4_buf, frame_list, fps=target_fps, codec="libx264", format="mp4")
+            mp4_bytes = mp4_buf.getvalue()
+
+            # Local mp4 save is a debug convenience. In production (S3
+            # configured) the container's ephemeral disk fills up with
+            # duplicates of what's already in S3 — skip the write unless
+            # the operator explicitly asks for it via ``LOCAL_MP4_SAVE=true``.
+            _local_save_forced = os.environ.get("LOCAL_MP4_SAVE", "").lower() == "true"
+            _local_save = self._output_dir and (
+                _S3_CLIENT is None or _local_save_forced
+            )
+            if _local_save:
+                save_dir = self._output_dir
+                os.makedirs(save_dir, exist_ok=True)
+                n_existing = len([f for f in os.listdir(save_dir) if f.endswith(".mp4")])
+                output_path = os.path.join(save_dir, f"{n_existing:06}_{timestamp}_n{n_blocks}.mp4")
+                with open(output_path, "wb") as f:
+                    f.write(mp4_bytes)
+                logger.info(f"Saved imaginary video locally: {output_path}")
+
+            if _S3_CLIENT is not None and _S3_POOL is not None and session.episode_id and session.run_id:
+                key = f"{_S3_PREFIX}/{session.run_id}/{session.episode_id}/imaginary/imaginary_episode.mp4"
+                _S3_POOL.submit(_upload_imaginary_to_s3, mp4_bytes, key, session.episode_id)
+            elif _S3_CLIENT is not None:
+                logger.warning(
+                    f"[s3] missing episode_id/run_id on session — skipping upload "
+                    f"(episode_id={session.episode_id!r} run_id={session.run_id!r})"
                 )
-                frames = rearrange(frames, "B C T H W -> B T H W C")
-                frames = frames[0]
-                frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                for frame in frames:
-                    frame_list.append(frame)
-                
-                if len(frame_list) > 0:
-                    sample_frame = frame_list[0]
-                    if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
-                        save_dir = self._output_dir
-                        os.makedirs(save_dir, exist_ok=True)
-                        all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
-                        timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-                        num_frames = len(frame_list)
-                        n = (num_frames - 1) // 8
-                        output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
-                        imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
-                        logger.info(f"Saved video on reset to: {output_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save video on reset: {e}")
-        
-        # Clear frame buffers
-        for key in self._frame_buffers:
-            self._frame_buffers[key] = []
-        
-        self._call_count = 0
-        self._is_first_call = True
-        self.video_across_time = []
-    
+        except Exception as e:
+            logger.warning(f"Failed to save imaginary video: {e}")
+
+    def _reset_state(self, session_ids: list[str] | None = None, save_video: bool = True) -> None:
+        """Evict one or more sessions, optionally saving their imaginary videos.
+
+        Args:
+            session_ids: Sessions to evict.  None evicts all active sessions.
+            save_video: Decode and save the accumulated video before eviction.
+        """
+        targets = session_ids if session_ids is not None else list(self._sessions.keys())
+        for sid in targets:
+            session = self._sessions.pop(sid, None)
+            if session is None:
+                continue
+            if save_video:
+                self._save_session_video(session)
+            logger.info(f"Session '{sid}' evicted (call_count={session.call_count}).")
+
     def reset(self, reset_info: dict) -> None:
         """Reset the policy state for a new episode.
-        
-        Clears frame buffers and resets call count.
+
+        The client may pass a ``session_ids`` list to target specific sessions;
+        if absent, all active sessions are evicted.
         """
-        self._reset_state(save_video=True)
+        session_ids = reset_info.get("session_ids", None)
+        self._reset_state(session_ids=session_ids, save_video=True)
 
 
-class WebsocketPolicyServer:
-    """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
-    Currently only implements the `load` and `infer` methods.
+class _DistributedWorker:
+    """Worker harness for non-rank-0 ranks.
+
+    Rank 0 runs the production ``RoboarenaServer`` (from
+    ``eval_utils.policy_server``); the other ranks just need to participate
+    in the distributed forward pass via ``dist.broadcast`` / ``dist.barrier``.
+    This class owns that loop and the obs-broadcast unpickling.
+
+    History: this used to be a full ``WebsocketPolicyServer`` with its own
+    ``_handler`` + per-10-chunk mp4 dump path. That handler was never
+    actually reached in production (rank 0 has used ``RoboarenaServer``
+    since the per-session-frame-buffers refactor); it carried ~290 lines
+    of duplicated VAE-decode + mp4-encode logic. Removed.
     """
 
     def __init__(
         self,
         policy: _base_policy.BasePolicy,
-        host: str = "0.0.0.0",
-        port: int | None = None,
-        metadata: dict | None = None,
-        output_dir: str | None = None,
         signal_group: dist.ProcessGroup | None = None,
     ) -> None:
         self._policy = policy
-        self._host = host
-        self._port = port
-        self._metadata = metadata or {}
-        self._output_dir = output_dir
-        logging.getLogger("websockets.server").setLevel(logging.INFO)
-        self.video_across_time = []
-        self._msg_index = 0
         self._signal_group = signal_group
-        # Create output directory if specified
-        if self._output_dir:
-            os.makedirs(self._output_dir, exist_ok=True)
-            os.makedirs(os.path.join(self._output_dir, "inputs"), exist_ok=True)
-    
-    def _save_input_obs(self, obs: dict) -> None:
-        """Save incoming observation images per message.
-        
-        Expected format: THWC (Time, Height, Width, Channel) with 4 frames.
-        Saves each frame as a separate PNG image: HWC format (uint8).
-        
-        Directory structure:
-        output_dir/inputs/{msg_index:06d}_{timestamp}/{obs_key}/f{frame_idx:02d}.png
-        """
-        if not self._output_dir:
-            return
-        timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-        base_dir = os.path.join(self._output_dir, "inputs", f"{self._msg_index:06d}_{timestamp}")
-        try:
-            os.makedirs(base_dir, exist_ok=True)
-        except Exception:
-            return
-
-        for key in ("video.exterior_image_1_left", "video.exterior_image_2_left", "video.wrist_image_left"):
-            if key not in obs:
-                continue
-            value = obs[key]
-            try:
-                # Convert to numpy if tensor
-                if isinstance(value, torch.Tensor):
-                    arr = value.detach().cpu().numpy()
-                else:
-                    arr = np.asarray(value)
-                
-                # Expected format: THWC (Time, Height, Width, Channel)
-                if arr.ndim != 4:
-                    logger.warning(f"obs key '{key}' has shape {arr.shape}, expected 4D (T,H,W,C)")
-                    continue
-                
-                # arr is (T, H, W, C)
-                T, H, W, C = arr.shape
-                
-                # Normalize to uint8
-                if arr.dtype == np.uint8:
-                    frames_u8 = arr
-                else:
-                    f = arr.astype(np.float32)
-                    # Common conventions: [-1,1] or [0,1]
-                    min_val = float(np.nanmin(f))
-                    max_val = float(np.nanmax(f))
-                    if min_val >= -1.1 and max_val <= 1.1:
-                        # Assume [-1,1] range
-                        frames_u8 = ((f + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-                    else:
-                        # Min-max scaling
-                        denom = (max_val - min_val) if (max_val - min_val) > 1e-6 else 1.0
-                        frames_u8 = ((f - min_val) / denom * 255.0).clip(0, 255).astype(np.uint8)
-                
-                # Save each frame: frames_u8[i] is (H, W, C)
-                key_dir = os.path.join(base_dir, key.replace("/", "_"))
-                os.makedirs(key_dir, exist_ok=True)
-                for frame_idx in range(T):
-                    frame = frames_u8[frame_idx]  # (H, W, C)
-                    # Handle grayscale (H, W) -> (H, W, 1)
-                    if frame.ndim == 2:
-                        frame = np.expand_dims(frame, axis=-1)
-                    imageio.imwrite(os.path.join(key_dir, f"f{frame_idx:02d}.png"), frame)
-                    
-            except Exception as e:
-                logger.warning(f"Failed to save obs key '{key}': {e}")
-                continue
-
-
-
-    def serve_forever(self, rank: int = 0) -> None:
-        asyncio.run(self.run(rank))
-
-    async def run(self, rank: int = 0):
-        if rank == 0:
-            async with _server.serve(
-                self._handler,
-                self._host,
-                self._port,
-                compression=None,
-                max_size=None,
-                process_request=_health_check,
-                ping_interval=None,
-            ) as server:
-                await server.serve_forever()
-        else:
-            # Non-rank-0 processes run a worker loop
-            await self._worker_loop()
 
     async def _worker_loop(self):
         """Worker loop for non-rank-0 processes to participate in distributed inference."""
@@ -528,187 +592,6 @@ class WebsocketPolicyServer:
         obs = pickle.loads(data_tensor.cpu().numpy().tobytes())
         return Batch(obs=obs)
 
-    def _broadcast_batch_to_workers(self, obs):
-        """Broadcast batch data from rank 0 to all other ranks."""
-        import pickle
-
-        # Serialize the obs
-        serialized = pickle.dumps(obs)
-        data_size = len(serialized)
-
-        # Broadcast size first
-        size_tensor = torch.tensor([data_size], dtype=torch.int64, device='cuda')
-        dist.broadcast(size_tensor, src=0)
-
-        # Broadcast data
-        data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
-        dist.broadcast(data_tensor, src=0)
-
-    async def _handler(self, websocket: _server.ServerConnection):
-        logger.info(f"Connection from {websocket.remote_address} opened")
-        packer = msgpack_numpy.Packer()
-
-        await websocket.send(packer.pack(self._metadata))
-
-        prev_total_time = None
-        signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
-        
-        try:
-            while True:
-                try:
-                    start_time = time.perf_counter()
-                    data = await websocket.recv()
-                    recv_done = time.perf_counter()
-                    obs = msgpack_numpy.unpackb(data)
-                    print(f"Wait Time: {recv_done - start_time:.2f} seconds")
-                    self._msg_index += 1
-
-                    infer_start_time = time.perf_counter()
-
-                    # Signal other ranks to continue (0 = continue)
-                    signal_tensor.zero_() 
-                    dist.broadcast(signal_tensor, src=0, group=self._signal_group) # <-- USE GLOO GROUP
-
-                    # Broadcast the obs to all ranks for distributed inference
-                    self._broadcast_batch_to_workers(obs)
-                    batch = Batch(obs=obs)
-
-                    # All ranks need to participate in the forward pass
-                    dist.barrier()
-                    forward_start_time = time.perf_counter()
-                    with torch.no_grad():
-                        result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-                    dist.barrier()
-                    print(f"Forward Time: {time.perf_counter() - forward_start_time:.2f} seconds")
-
-                    action_chunk_dict = result_batch.act
-                    video_chunk = video_pred
-
-                    print(f"Inference Time: {time.perf_counter() - infer_start_time:.2f} seconds")
-
-                    self.video_across_time.append(video_chunk)
-
-                    if len(self.video_across_time) > 10:
-                        frame_list = []
-                        video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
-                        )
-                        frames = rearrange(frames, "B C T H W -> B T H W C")
-                        frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                        # Add each frame individually to the list
-                        for frame in frames:
-                            frame_list.append(frame)
-
-                        sample_frame = frame_list[0]
-                        if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
-                            # Save all frames as a single MP4 file
-                            save_dir = self._output_dir if self._output_dir else "."
-                            os.makedirs(save_dir, exist_ok=True)
-                            all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
-                            timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-                            num_frames = len(frame_list)
-                            n = (num_frames - 1) // 8  # num_frames = 8n+1, so n = (num_frames-1)/8
-                            output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
-                            imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
-                            print(f"Saved video to: {output_path}")
-                        else:
-                            print(f"Warning: Invalid frame shape {sample_frame.shape}. Expected (H, W, C) with C in [1, 3, 4]. Skipping video save.")
-
-                        self.video_across_time = []
-                    elif self._policy.trained_model.action_head.current_start_frame == 1 + self._policy.trained_model.action_head.num_frame_per_block and len(self.video_across_time) > 1:
-                        print("current_start_frame == 1 + num_frame_per_block and len(self.video_across_time) > 1")
-                        frame_list = []
-                        video_across_time_cat = torch.cat(self.video_across_time[:-1], dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
-                        )
-                        frames = rearrange(frames, "B C T H W -> B T H W C")
-                        frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                        # Add each frame individually to the list
-                        for frame in frames:
-                            frame_list.append(frame)
-                        sample_frame = frame_list[0]
-                        if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
-                            # Save all frames as a single MP4 file
-                            save_dir = self._output_dir if self._output_dir else "."
-                            os.makedirs(save_dir, exist_ok=True)
-                            all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
-                            timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-                            num_frames = len(frame_list)
-                            n = (num_frames - 1) // 8  # num_frames = 8n+1, so n = (num_frames-1)/8
-                            output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
-                            imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
-                            print(f"Saved video to: {output_path}")
-                        self.video_across_time = [video_chunk]
-
-                    
-                    def batch_to_dict(batch):
-                        out = {}
-                        for k in dir(batch):
-                            if not k.startswith("action."):
-                                continue
-                            out[k] = getattr(batch, k)
-                        return out
-                    action_chunk_dict = batch_to_dict(action_chunk_dict)
-                    await websocket.send(packer.pack(action_chunk_dict))
-
-                except websockets.ConnectionClosed:
-                    logger.info(f"Connection from {websocket.remote_address} closed")
-                    if len(self.video_across_time) > 0:
-                        frame_list = []
-                        video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
-                            tiled=self._policy.trained_model.action_head.tiled,
-                            tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                            tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
-                        )
-                        frames = rearrange(frames, "B C T H W -> B T H W C")
-                        frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-                        # Add each frame individually to the list
-                        for frame in frames:
-                            frame_list.append(frame)
-
-                        sample_frame = frame_list[0]
-                        if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
-                            # Save all frames as a single MP4 file
-                            save_dir = self._output_dir if self._output_dir else "."
-                            os.makedirs(save_dir, exist_ok=True)
-                            all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
-                            timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
-                            num_frames = len(frame_list)
-                            n = (num_frames - 1) // 8  # num_frames = 8n+1, so n = (num_frames-1)/8
-                            output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
-                            imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
-                            print(f"Saved video to: {output_path}")
-                        else:
-                            print(f"Warning: Invalid frame shape {sample_frame.shape}. Expected (H, W, C) with C in [1, 3, 4]. Skipping video save.")
-
-                    self.video_across_time = []
-                    break
-                except Exception:
-                    await websocket.send(traceback.format_exc())
-                    await websocket.close(
-                        code=websockets.frames.CloseCode.INTERNAL_ERROR,
-                        reason="Internal server error. Traceback included in previous frame.",
-                    )
-                    raise
-        finally:
-            logger.info(f"Rank 0: Client session ended. Sending idle signal (2) to workers.")
-            signal_tensor.fill_(2)  # Set tensor value to 2
-            dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-            # When connection closes, signal other ranks to continue waiting for next connection
-            # (or implement proper shutdown if needed)
 
 
 def init_mesh() -> DeviceMesh:
@@ -740,6 +623,10 @@ def _health_check(connection: _server.ServerConnection, request: _server.Request
 def main(args: Args) -> None:
     # Set environment variable for DIT cache.
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
+    os.environ["NUM_DIT_STEPS"] = str(args.num_dit_steps)
+    os.environ["DREAMZERO_PROFILE"] = "true" if args.profile_inference else "false"
+    if args.num_inference_steps is not None:
+        os.environ["NUM_INFERENCE_STEPS"] = str(args.num_inference_steps)
 
     # Use TE cuDNN backend for attention.
     os.environ["ATTENTION_BACKEND"] = "TE"
@@ -747,6 +634,10 @@ def main(args: Args) -> None:
     # Increase the recompile limit to 100 for inference due
     # to autoregressive nature of the model (several possible shapes).
     torch._dynamo.config.recompile_limit = 800
+
+    # Wire up S3 upload for imaginary mp4s (idempotent; no-op if env vars
+    # absent so local dev keeps working).
+    _maybe_init_s3()
 
     embodiment_tag = "oxe_droid"
     model_path = args.model_path
@@ -793,6 +684,7 @@ def main(args: Args) -> None:
         groot_policy=policy,
         signal_group=signal_group,
         output_dir=output_dir,
+        no_frame_buffer=args.no_frame_buffer,
     )
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
@@ -816,17 +708,11 @@ def main(args: Args) -> None:
         )
         roboarena_server.serve_forever()
     else:
-        # Non-rank-0 processes need to run worker loop for distributed inference
-        # We'll use the existing WebsocketPolicyServer's worker loop mechanism
-        server = WebsocketPolicyServer(
-            policy=policy,
-            host="0.0.0.0",
-            port=args.port,
-            metadata=policy_metadata,
-            output_dir=output_dir,
-            signal_group=signal_group,
-        )
-        asyncio.run(server._worker_loop())
+        # Non-rank-0 ranks just participate in the distributed forward pass.
+        # Rank 0 owns the WebSocket via RoboarenaServer above; workers stay
+        # in the broadcast/barrier loop until the signal_group says stop.
+        worker = _DistributedWorker(policy=policy, signal_group=signal_group)
+        asyncio.run(worker._worker_loop())
     
 
 
